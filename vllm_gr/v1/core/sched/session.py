@@ -67,6 +67,11 @@ class GRSessionState:
     _pending_terminal_result: BeamBatchResult | None = field(default=None, init=False, repr=False)
     _terminal_emitted: bool = field(default=False, init=False, repr=False)
     _kv_dispatch_leases: dict[int, Any] = field(default_factory=dict, init=False, repr=False)
+    _metrics_dispatch_timers: dict[int, Any] = field(default_factory=dict, init=False, repr=False)
+    _metrics_started: bool = field(default=False, init=False, repr=False)
+    _metrics_decode_timer: Any = field(default=None, init=False, repr=False)
+    _metrics_decode_seconds: float | None = field(default=None, init=False, repr=False)
+    _metrics_prompt_work: tuple[tuple[int, int], ...] = field(default=(), init=False, repr=False)
 
     def __post_init__(self) -> None:
         if not self.session_id:

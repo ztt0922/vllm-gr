@@ -10,6 +10,7 @@ from unittest.mock import Mock
 import pytest
 import torch
 
+from vllm_gr.v1.metrics.gpu import GPUStageMetrics
 from vllm_gr.v1.worker.cuda import gpu_beam_stage_runner as stages
 from vllm_gr.v1.worker.cuda.gpu_stage_hooks import CudaStageHooksType
 from vllm_gr.v1.worker.cuda.v1.gpu_beam_stage_runner_v1 import CudaStageHooksV1
@@ -93,6 +94,10 @@ def sample_owner(request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
         copy_stream=Mock(),
         copy_done=[Mock()],
     )
+    monkeypatch.setattr(
+        "vllm_gr.v1.metrics.gpu.metrics_config", lambda: SimpleNamespace(enabled=False)
+    )
+    owner.metrics = GPUStageMetrics(owner, stages.CONTROL_CAPACITY)
     monkeypatch.setattr(torch.cuda, "current_stream", Mock(return_value=object()))
     monkeypatch.setattr(torch.cuda, "stream", lambda _: nullcontext())
     monkeypatch.setattr(

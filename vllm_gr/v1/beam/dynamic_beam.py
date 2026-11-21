@@ -365,6 +365,10 @@ class DynamicBeamState:
             selected_scores = selected_scores.gather(1, order)
         token_ids = candidates.token_ids.reshape(self.batch_size, -1).gather(1, flat_indices)
         token_ids = token_ids.masked_fill(~torch.isfinite(selected_scores), 0)
+        metrics = getattr(self, "metrics", None)
+        if metrics is not None:
+            metrics.stop("beam_select")
+            metrics.start("lineage_kv")
         history_index = parents[:, :, None].expand(
             self.batch_size, output_width, self.max_decode_steps
         )
@@ -377,6 +381,9 @@ class DynamicBeamState:
             reorder_stage_kv(
                 self.context, input_width, output_width, parents, history_steps=stage_index
             )
+        if metrics is not None:
+            metrics.stop("lineage_kv")
+            metrics.start("beam_select")
         self.sequence = sequence
         self.scores = selected_scores
         self.parent_history = parent_history

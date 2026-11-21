@@ -470,6 +470,9 @@ class BeamSearchRunner:
                 raise ValueError(
                     f"{name} must be contiguous CUDA {dtype} [{rows}, {candidate_width}]"
                 )
+        metrics = getattr(self, "_gr_metrics", None)
+        if metrics is not None:
+            metrics.start("beam_select")
         s, w = self._state, self._scratch
         block = triton.next_power_of_2(width)
         candidate_block = triton.next_power_of_2(candidate_width)
@@ -579,6 +582,9 @@ class BeamSearchRunner:
             BLOCK=candidate_block,
             PREFILL=prefill,
         )
+        if metrics is not None:
+            metrics.stop("beam_select")
+            metrics.start("lineage_kv")
         extent = self.state.sequence.shape[2]
         ops._stage_sequence_kernel[(width,)](
             s["sequence"],
@@ -621,6 +627,9 @@ class BeamSearchRunner:
                 *self._kv_args, s["parent_ids"], **self._kv_kwargs
             )
             _select_kv_scatter_kernel[self._kv_grid](*self._kv_args, **self._kv_kwargs)
+        if metrics is not None:
+            metrics.stop("lineage_kv")
+            metrics.start("beam_select")
         ops._commit_step_kernel[(1,)](
             s["active_mask"],
             s["num_generated_tokens"],
@@ -635,6 +644,8 @@ class BeamSearchRunner:
             BLOCK=block,
             PREFILL=prefill,
         )
+        if metrics is not None:
+            metrics.stop("beam_select")
 
 
 @dataclass(frozen=True, slots=True)

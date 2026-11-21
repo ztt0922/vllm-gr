@@ -133,6 +133,9 @@ def make_patched_process_outputs(original_process_outputs):
 
     @wraps(original_process_outputs)
     def patched_process_outputs(self, engine_core_outputs, *args, **kwargs):
+        from vllm_gr.v1.metrics.prometheus import consume_outputs
+
+        consume_outputs(self, engine_core_outputs)
         note_admission_rejections(self, engine_core_outputs)
         return original_process_outputs(self, engine_core_outputs, *args, **kwargs)
 

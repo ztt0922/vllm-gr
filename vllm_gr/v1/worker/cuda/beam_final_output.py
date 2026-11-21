@@ -305,6 +305,11 @@ class GPUBeamFinalOutput:
                     ROW_STRIDE=self.layout.row_stride,
                     ROW_BLOCK=triton.next_power_of_2(2 * state.max_new_tokens),
                 )
+        # Fallback finalization after pending was cleared must not touch a successor.
+        metrics = getattr(owner, "metrics", None) if control is not None else None
+        if metrics is not None:
+            metrics.stop("final_pack")
+            metrics.snapshot(owner, None, final=True)
         self.pack_ready.record(produced)
         copy_words = (
             _CONTROL_WORDS
@@ -315,6 +320,8 @@ class GPUBeamFinalOutput:
         with torch.cuda.stream(owner.copy_stream):
             owner.copy_stream.wait_event(self.pack_ready)
             self.host[:copy_words].copy_(self.device[:copy_words], non_blocking=True)
+            if metrics is not None and owner.pending is not None:
+                metrics.enqueue_copy(owner.pending[1])
             self.ready.record(owner.copy_stream)
         self.final_d2h_count += 1
         self.final_d2h_bytes += copy_words * self.device.element_size()
