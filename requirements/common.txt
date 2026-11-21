@@ -10,6 +10,7 @@
 # in the platform files. The retained PyArrow pin is explained below.
 
 msgspec
+prometheus-client>=0.20.0
 regex
 pandas>=3.0.0
 requests>=2.32.0

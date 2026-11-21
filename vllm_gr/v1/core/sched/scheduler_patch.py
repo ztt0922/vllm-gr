@@ -453,6 +453,9 @@ def _finalize_ready_gr_session(scheduler, result, session) -> None:
     kv_params = dict(target_output.kv_transfer_params or {})
     kv_params["gr_batch_result"] = terminal_result
     target_output.kv_transfer_params = kv_params
+    from vllm_gr.v1.metrics.telemetry import terminal_metrics
+
+    _attach_gr_metrics(scheduler, result, session, terminal_metrics(session, terminal_result))
     finished_requests = set(target_outputs.finished_requests or ())
     finished_requests.add(request_id)
     target_outputs.finished_requests = finished_requests
@@ -470,6 +473,27 @@ def _finalize_ready_gr_session(scheduler, result, session) -> None:
         )
 
     _close_gr_session(scheduler, session)
+
+
+def _attach_gr_metrics(scheduler, result, session, value) -> None:
+    """Reuse native IPC; telemetry-only frames contain no generated token."""
+    if not value:
+        return
+    from vllm.v1.engine import EngineCoreOutput, EngineCoreOutputs
+    from vllm_gr.v1.metrics.telemetry import TELEMETRY_KEY
+
+    _, target = _find_gr_output(result, session.session_id)
+    if target is None:
+        client = session.request.items[0].request.client_index
+        outputs = result.setdefault(client, EngineCoreOutputs(outputs=[]))
+        target = EngineCoreOutput(request_id=session.session_id, new_token_ids=[])
+        outputs.outputs.append(target)
+    params = dict(target.kv_transfer_params or {})
+    params[TELEMETRY_KEY] = [*params.get(TELEMETRY_KEY, ()), value]
+    model_config = getattr(getattr(scheduler, "vllm_config", None), "model_config", None)
+    name = getattr(model_config, "served_model_name", None) or "gr"
+    params["gr_metrics_model_name"] = name[0] if isinstance(name, (list, tuple)) else str(name)
+    target.kv_transfer_params = params
 
 
 def _patch_scheduler_update_from_output(scheduler_cls) -> None:
@@ -542,9 +566,24 @@ def _patch_scheduler_update_from_output(scheduler_cls) -> None:
                 if output.request_id in dispatched_sessions:
                     output.new_token_ids = []
 
-        # A terminal result may arrive before a look-ahead successor. Buffer it
-        # in GRSessionState and publish only after every physical dispatch has
-        # drained, together with a genuinely finished native output.
+        from vllm_gr.v1.beam.dispatch import GR_WORKER_RESULT_ATTR
+        from vllm_gr.v1.metrics.telemetry import stage_finished
+
+        worker_results = getattr(model_runner_output, GR_WORKER_RESULT_ATTR, {}) or {}
+        if not isinstance(worker_results, dict):
+            worker_results = {}
+        for session, completion in zip(dispatched_sessions.values(), completions, strict=True):
+            metadata = gr_stages[session.session_id]
+            value = stage_finished(
+                session,
+                metadata,
+                worker_results.get(session.session_id),
+                error=bool(completion.error),
+            )
+            _attach_gr_metrics(self, result, session, value)
+
+        # Account for the stage before finalization, including Prefill-only
+        # sessions. Publish terminal metrics only after physical dispatches drain.
         for session in updated_sessions:
             _finalize_ready_gr_session(self, result, session)
 

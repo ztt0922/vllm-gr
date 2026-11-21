@@ -205,6 +205,8 @@ class GRWorkerResult:
     terminal_result: BeamBatchResult | None = None
     resources_released: bool = False
     owner_generation: int = 0
+    # Compact CPU telemetry; device tensors and events never cross executor IPC.
+    metrics: dict[str, Any] | None = None
 
 
 # Every GRStageMetadata field is either proven once per session and then compared

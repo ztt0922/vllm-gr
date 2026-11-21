@@ -516,6 +516,9 @@ def attach_gr_stage_metadata(
         num_prompt_tokens_by_request=prompt_tokens,
     )
     session._dispatch_records[dispatch_id] = metadata
+    from vllm_gr.v1.metrics.telemetry import stage_started
+
+    stage_started(session, metadata, scheduler_output)
     session._next_dispatch_id += 1
     session._in_flight_dispatches.add(dispatch_id)
     session.worker_resources_allocated = True

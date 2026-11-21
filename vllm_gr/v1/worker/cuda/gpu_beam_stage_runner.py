@@ -64,6 +64,7 @@ from vllm_gr.v1.beam.dispatch import (
     validate_dispatch_session,
 )
 from vllm_gr.v1.beam.execution_batch import BeamBatchExecutionView
+from vllm_gr.v1.metrics.timer import WallTimer
 from vllm_gr.v1.worker.cuda.beam_final_output import GPUBeamFinalOutput
 from vllm_gr.v1.worker.cuda.beam_search_runner import (
     BeamBatchSearchRunner,
@@ -142,13 +143,25 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
                 return self._output
             # CUDA/D2H failures are fatal and must reach the native Executor
             # failure channel. Never publish a successful release after one.
+            metrics = None
             try:
                 if self.terminal_payload:
                     controls = [self.owner.final_output.wait_embedded_control()]
                 else:
                     self.owner.copy_done[self.slot].synchronize()
                     controls = self.owner.host_control[self.slot].tolist()
+                timer = getattr(self.owner, "metrics", None)
+                metrics = timer.consume(self.slot) if timer is not None else None
+                materialize = (
+                    WallTimer()
+                    if metrics is not None and metrics.get("sampled") and self.terminal_payload
+                    else None
+                )
+                if materialize is not None:
+                    materialize.start()
                 self._output = self._convert(controls, final_ready=self.terminal_payload)
+                if materialize is not None and metrics is not None:
+                    metrics["timings"]["output_materialize"] = materialize.stop()
             except (ValueError, TypeError, IndexError) as error:
                 self._output = self._conversion_failure(error)
             finally:
@@ -156,6 +169,8 @@ class AsyncGPUBeamOutput(AsyncModelRunnerOutput):  # type: ignore[misc]
                     self.owner.control_busy[self.slot] = False
                     self.owner.control_drained.notify_all()
             results = getattr(self._output, GR_WORKER_RESULT_ATTR)
+            for session_id, result in results.items():
+                results[session_id] = replace(result, metrics=metrics)
             # The Scheduler looks ahead, so a terminal receipt from an earlier
             # stage can still be followed by an already-issued successor. Only
             # the declared last stage proves that nothing is still in transit;
@@ -541,6 +556,9 @@ class GPUBeamStageRunner:
         self.produced_ready = [torch.Event() for _ in range(CONTROL_CAPACITY)]
         self.copy_done = [torch.Event() for _ in range(CONTROL_CAPACITY)]
         self.copy_stream = torch.cuda.Stream(device=beam.state.device)
+        from vllm_gr.v1.metrics.gpu import GPUStageMetrics
+
+        self.metrics = GPUStageMetrics(self, CONTROL_CAPACITY)
         self.last_work = torch.Event()
         self.closed = False
         self.cancelled = False
@@ -890,6 +908,8 @@ class GPUBeamStageRunner:
         worker._current_scheduler_output = scheduler_output
         worker._current_beam_data = {}
         worker._current_beam_info = None
+        assert self.pending is not None
+        self.metrics.begin(self.pending[1], execution.entries[0].metadata, self)
         for entry in execution.entries:
             m = entry.metadata
             if m.kind is GRStageKind.PREFILL:
@@ -922,6 +942,7 @@ class GPUBeamStageRunner:
         if grammar_output is not None or self.pending is None:
             raise RuntimeError("GR sample requires a pending dispatch and no grammar output")
         execution, slot = self.pending
+        self.metrics.stop("forward")
         terminal_payload = False
         for entry in execution.entries:
             m = entry.metadata
@@ -933,6 +954,7 @@ class GPUBeamStageRunner:
                 rows = layout.batch_size if m.kind is GRStageKind.PREFILL else entry.row_count
                 candidate_width = layout.candidate_top_k
                 device = model_output.device
+                self.metrics.start("constraint_select")
                 candidates = (
                     self.dynamic.candidate_buffers(rows, candidate_width)
                     if self.dynamic is not None
@@ -1019,13 +1041,23 @@ class GPUBeamStageRunner:
                             candidates[2],
                             self.counts[:rows],
                         )
+                self.metrics.stop("constraint_select")
+                self.metrics.note_candidate_width(slot, int(candidates[0].shape[1]))
+                timer = self.metrics if self.metrics.active_slot is not None else None
+                for runner in getattr(self.beam, "runners", (self.beam,)):
+                    runner._gr_metrics = timer
                 candidate_batch = BeamCandidateBatch(layout, *candidates)
                 if self.dynamic is not None:
+                    self.dynamic.state.metrics = timer
+                    self.metrics.start("beam_select")
                     self.dynamic.advance(layout, candidates, m.is_last_stage)
+                    self.metrics.stop("beam_select")
                 elif m.kind is GRStageKind.PREFILL:
                     self.beam.initialize_from_prefill(candidate_batch)
                 else:
                     self.beam.advance(candidate_batch)
+                if not m.is_last_stage:
+                    self.metrics.snapshot(self, layout)
             state_rows = slice(0, len(self.bindings))
             control = self.device_control[slot, 0]
             control[:1].copy_(
@@ -1041,7 +1073,10 @@ class GPUBeamStageRunner:
             # The fixed-length terminal stage returns one packed payload whose
             # header replaces the separate per-stage control D2H.
             if m.is_last_stage:
+                self.metrics.start("final_pack")
                 terminal_payload = self.final_output.enqueue(self, control)
+                if not terminal_payload:
+                    self.metrics.stop("final_pack")
         stream = torch.cuda.current_stream(self.beam.state.device)
         self.produced_ready[slot].record(stream)
         self.last_work.record(stream)
@@ -1049,9 +1084,11 @@ class GPUBeamStageRunner:
             with torch.cuda.stream(self.copy_stream):
                 self.copy_stream.wait_event(self.produced_ready[slot])
                 self.host_control[slot].copy_(self.device_control[slot], non_blocking=True)
+                self.metrics.enqueue_copy(slot)
                 self.copy_done[slot].record(self.copy_stream)
         self.hooks.finish_native_output()
         self.pending = None
+        self.metrics.active_slot = None
         return AsyncGPUBeamOutput(self, execution, slot, terminal_payload)
 
     def completion_view(self, binding: BeamRequestBinding) -> dict[str, torch.Tensor]:
